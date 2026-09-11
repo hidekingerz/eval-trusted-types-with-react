@@ -1,0 +1,11 @@
+{
+  "name": "tt-eval-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "run": "node run.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}
