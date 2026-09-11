@@ -118,6 +118,56 @@ React 経由のケースで違反が **2 回** 出るのは、`dangerouslySetInn
 render フェーズ (`completeWork` → `setInitialProperties`) で行われ、React が例外を受けて
 **同期で 1 回リトライ**してから error boundary に落とすためです。1 ケースにつきシンクが 2 回叩かれています。
 
+## 観測結果 (2026-09-11, Chromium 141)
+
+全組み合わせの結果表は [docs/RESULTS.md](docs/RESULTS.md) にあります (`e2e/run.mjs` の出力そのもの)。
+以下はそこから読み取れる要点です。
+
+### React 19.3 で変わったこと
+
+- **19.2 → 19.3 で結果が変わったケースは `react-iframe-srcdoc-trusted` だけ**でした。
+  `<iframe srcDoc={policy.createHTML(…)}>` は 19.2 では `'' + value` で文字列化されて `setAttribute` に渡り
+  TypeError (強制時) になりましたが、19.3 では TrustedHTML のまま渡って描画されます。
+- `dangerouslySetInnerHTML={{__html: policy.createHTML(…)}}` は **19.2 でも 19.3 でも通ります**。
+  react-dom は `__html` を文字列化せず `el.innerHTML = __html` に直接渡しているためで、19.3 の変更点はここではありません。
+- pass-through の default ポリシーを置いて「どのシンクにどんな値が届いたか」を見ると差が明確です:
+  - `<script src={TrustedScriptURL}>` … 19.2 は `createScriptURL(Element setAttribute)` が呼ばれる (= 文字列化されて default ポリシーに回った)。19.3 は呼ばれない (= オブジェクトのまま届いた)。
+  - `<iframe srcDoc={TrustedHTML}>` … 同様に 19.2 だけ `createHTML(Element setAttribute)` が呼ばれる。
+
+### React 経由でハマるところ (19.2 / 19.3 共通)
+
+- **React ツリー内の `<script>` は Trusted Types 強制下では default ポリシー無しに描画できません。**
+  react-dom は `<script>` 要素を `div.innerHTML = "<script></script>"` (プレーン文字列) で生成するため、
+  `require-trusted-types-for 'script'` があると要素生成の時点で TypeError になります (`src` が TrustedScriptURL でも同じ)。
+- **`<script async src={TrustedScriptURL}>` は hoist されません。** hoist の条件が `typeof props.src === "string"` なので
+  オブジェクトを渡すと in-tree 経路 (上記 innerHTML 生成、実行されない) に落ちます。
+  文字列の `<script async src>` は hoist されて実行されますが、強制下では `setAttribute("src", string)` で止まり、
+  例外は表に出ずに head に追加されないだけ (`blocked`) でした。
+- default ポリシーの `createHTML` が `<script>` を除去するサニタイザだと (DOMPurify の既定挙動と同じ)、
+  react-dom の `<script></script>` 生成が空になり `removeChild` の TypeError で落ちます (`?default=sanitize` の結果)。
+- `<script>{policy.createScript(…)}</script>` は React 側で「オブジェクトは子要素にできない」(#31) として弾かれます。
+- render フェーズで失敗したケースは違反イベントが 2 回記録されます。React が例外後に同期で 1 回リトライするためです。
+- React 自体の mount では違反は出ません (`violations during React mount` は常に 0。ポリシー生成失敗による違反を除く)。
+  `enforce-strict` (`script-src 'self'` 等を併用) でも Vite ビルドの SPA はそのまま動きます。
+
+### CSP 設定ごとの挙動
+
+| シナリオ | 観測 |
+|---|---|
+| `none` / `policy-names-only` | 全シンクが文字列を受け付ける。`policy-names-only` は名前制限だけ効く (`?dup=1` の 2 回目が失敗) |
+| `report-only` | 何も止まらず全ケース `injected`。文字列を渡したケースにだけ `disposition: report` の違反イベントとレポートが付く |
+| `enforce` | 文字列ケースは TypeError、Trusted Types オブジェクトのケースは通る。ポリシー名は自由 |
+| `enforce-named` | `enforce` と同じ。`?dup=1` は `Policy with name "react-eval" already exists` で失敗し、mount 時に違反が 1 件記録される |
+| `enforce-named-no-default` | `?default=…` が `Policy "default" disallowed` で失敗。default ポリシーに頼るケースは全て TypeError |
+| `enforce-allow-duplicates` | `?dup=1` の 2 回目の `createPolicy` が成功する |
+| `enforce-no-policies` | アプリのポリシーも default も作れず、Trusted Types オブジェクトを使うケースは全て `skipped`、文字列ケースは全て TypeError |
+| `enforce-strict` | `enforce-named` と同じ結果。`script-src 'self'` 等を足しても SPA・バックエンドスクリプトの読み込みに影響なし |
+| `enforce-with-report-only` | 強制部分は `enforce` と同じ。Report-Only 側の名前制限は `?default=…` で `report` 違反として記録されるが作成自体は成功する |
+
+default ポリシー (`?default=sanitize` / `passthrough`) を置くと、`enforce-named-no-default` と `enforce-no-policies` 以外では
+文字列ケースも通るようになります。React が触るシンクは `Element innerHTML` / `Element setAttribute` /
+`HTMLScriptElement textContent` の 3 種類であることが `default policy calls` 列から分かります。
+
 ## WebMCP
 
 SPA は起動時に `document.modelContext` (2026 年の仕様改訂後) または `navigator.modelContext`
